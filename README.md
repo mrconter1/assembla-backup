@@ -26,16 +26,16 @@ Everything the API returns is saved as **raw JSON** (faithful and re-importable)
 
 1. In Assembla, go to **My Profile → API Applications & Sessions** and **Register a new personal key** with **both**:
    - *API access* ✔ (for the REST API)
-   - *Repository access* ✔ (the key secret doubles as your Git-over-HTTPS password)
+   - *Repository access* ✔ (the secret doubles as your Git/SVN-over-HTTPS password)
 2. Copy `.env.example` to `.env` and fill in:
    ```
    ASSEMBLA_API_KEY=your_key
    ASSEMBLA_API_SECRET=your_secret
-   # Only needed if a space has an SVN repo:
+   # Required if any space has a git or SVN repository:
    ASSEMBLA_USERNAME=your_assembla_login
    ```
 
-The API is called with headers `X-Api-Key` / `X-Api-Secret` against `https://api.assembla.com/v1/`. Repositories are cloned via `https://<key>:<secret>@git.assembla.com/<repo>.git`.
+The REST API uses headers `X-Api-Key` / `X-Api-Secret` against `https://api.assembla.com/v1/`. Repositories authenticate differently: git and SVN over HTTPS use your **Assembla login** (`ASSEMBLA_USERNAME`) as the username and the **API secret** as the password (the API key is rejected for repo access). So `ASSEMBLA_USERNAME` is required whenever a backed-up space contains a repository.
 
 ## Usage
 
@@ -57,7 +57,7 @@ python assembla_backup.py --no-zip
 | `--spaces <name...>` | all accessible spaces | restrict to specific spaces |
 | `--no-zip` | off (zip is created) | keep the output folder, skip zipping |
 | `--out <dir>` | `./` | where the backup folder/zip is written |
-| `--workers <n>` | `8` | concurrent requests for comments/files/wiki |
+| `--workers <n>` | `8` | concurrent requests for comments/files/wiki; raise for speed (up to a 32-connection pool) |
 | `--strict-files` | off | make any file-download failure fatal (see below) |
 | `--list-spaces` | - | list spaces the key can access, then exit |
 
@@ -85,7 +85,9 @@ assembla-backup-<timestamp>/
 
 The tool **stops on the first unexpected error** - any `401/403/unexpected 404/5xx` raises and halts. It never silently skips data. The final `.zip` is written **only after every step of every space succeeds**, so a zip always means "verified complete." A failed run leaves the working folder for inspection but produces **no zip**.
 
-Rate-limit responses (`429`/`503`) are retried with backoff (honoring `Retry-After`, with jitter) before being treated as a failure.
+Rate-limit responses (`429`/`503`) and transient connection errors (dropped connections, timeouts) are retried with backoff (honoring `Retry-After`, with jitter) before being treated as a failure. A 404 on a list endpoint is treated as "this space lacks that tool" and skipped, since spaces vary in which tools they have.
+
+Repositories are backed up **first** (right after discovering a space's tools), so an auth or tooling problem surfaces in seconds rather than after a long crawl.
 
 **One deliberate exception: individual file downloads.** Assembla occasionally hands out broken presigned S3 URLs (e.g. a signature signed for the wrong region), so a specific attachment can be un-downloadable through no fault of yours. Rather than let one dead blob abort a multi-space backup, such a file is **recorded and skipped**, listed under `failed_downloads` in `manifest.json`, and the final message clearly says "complete EXCEPT N unreachable file(s)" instead of "verified complete". Pass `--strict-files` to make these fatal instead.
 
