@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -401,21 +402,35 @@ def clone_mirror(url_with_creds, dest: Path):
 
 
 def svn_dump(url, dest: Path, username, password):
-    """Full-history dump of a remote SVN repo via svnrdump (all revisions)."""
+    """Full-history dump of a remote SVN repo via svnrdump (all revisions).
+
+    svnrdump reports "* Dumped revision N." on stderr; we stream that to show a
+    throttled progress counter, while keeping the last lines for error context.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         raise BackupError(f"Destination already exists: {dest}")
     with open(dest, "wb") as fh:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["svnrdump", "dump", "--non-interactive", "--no-auth-cache",
              "--username", username, "--password", password, url],
-            stdout=fh, stderr=subprocess.PIPE, text=False,
+            stdout=fh, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
         )
-    if result.returncode != 0:
-        raise BackupError(
-            f"svnrdump dump failed for {dest.name}: "
-            f"{result.stderr.decode(errors='replace').strip()[:400]}"
-        )
+        tail = deque(maxlen=20)
+        revs = 0
+        for line in proc.stderr:
+            line = line.rstrip()
+            if not line:
+                continue
+            tail.append(line)
+            if line.startswith("* Dumped revision"):
+                revs += 1
+                if revs % 100 == 0:
+                    info(f"  dumped {revs} revisions")
+        proc.wait()
+    if proc.returncode != 0:
+        raise BackupError(f"svnrdump dump failed for {dest.name}: {' | '.join(tail)[:400]}")
+    info(f"  dumped {revs} revisions total")
 
 
 def make_zip(folder: Path) -> Path:
