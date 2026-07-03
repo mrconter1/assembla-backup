@@ -498,13 +498,24 @@ def svn_dump(url, dest: Path, username, password):
     info(f"  dumped {revs} revisions total")
 
 
+def human_size(num_bytes):
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
+
 def make_zip(folder: Path) -> Path:
     zip_path = folder.with_suffix(".zip")
     step(f"Zipping -> {zip_path.name}")
+    count = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in folder.rglob("*"):
             if p.is_file():
                 zf.write(p, p.relative_to(folder.parent))
+                count += 1
+    info(f"{count} files, {human_size(zip_path.stat().st_size)}")
     return zip_path
 
 
@@ -590,14 +601,16 @@ def main():
               f"(Assembla-side errors); listed in manifest.failed_downloads{RESET}")
 
     if args.no_zip:
-        ok(f"Done. Backup folder: {root}")
+        folder_size = sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+        ok(f"Done. Backup folder ({human_size(folder_size)}): {root}")
     elif failed:
         zip_path = make_zip(root)
-        print(f"{YELLOW}    Backup complete EXCEPT {len(failed)} unreachable file(s): "
-              f"{zip_path}{RESET}")
+        print(f"{YELLOW}    Backup complete EXCEPT {len(failed)} unreachable file(s) "
+              f"({human_size(zip_path.stat().st_size)}): {zip_path}{RESET}")
     else:
         zip_path = make_zip(root)
-        ok(f"Done. Verified-complete backup: {zip_path}")
+        ok(f"Done. Verified-complete backup "
+           f"({human_size(zip_path.stat().st_size)}): {zip_path}")
     return 0
 
 
