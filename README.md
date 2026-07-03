@@ -54,6 +54,9 @@ python assembla_backup.py --no-zip
 | `--spaces <name...>` | all accessible spaces | restrict to specific spaces |
 | `--no-zip` | off (zip is created) | keep the output folder, skip zipping |
 | `--out <dir>` | `./` | where the backup folder/zip is written |
+| `--workers <n>` | `8` | concurrent requests for comments/files/wiki |
+| `--strict-files` | off | make any file-download failure fatal (see below) |
+| `--list-spaces` | - | list spaces the key can access, then exit |
 
 ## Output structure
 
@@ -77,7 +80,9 @@ assembla-backup-<timestamp>/
 
 The tool **stops on the first unexpected error** - any `401/403/unexpected 404/5xx` raises and halts. It never silently skips data. The final `.zip` is written **only after every step of every space succeeds**, so a zip always means "verified complete." A failed run leaves the working folder for inspection but produces **no zip**.
 
-Rate-limit responses (`429`/`503`) are the one exception: they are retried with backoff a few times before being treated as a failure.
+Rate-limit responses (`429`/`503`) are retried with backoff (honoring `Retry-After`, with jitter) before being treated as a failure.
+
+**One deliberate exception: individual file downloads.** Assembla occasionally hands out broken presigned S3 URLs (e.g. a signature signed for the wrong region), so a specific attachment can be un-downloadable through no fault of yours. Rather than let one dead blob abort a multi-space backup, such a file is **recorded and skipped**, listed under `failed_downloads` in `manifest.json`, and the final message clearly says "complete EXCEPT N unreachable file(s)" instead of "verified complete". Pass `--strict-files` to make these fatal instead.
 
 ## Not supported
 

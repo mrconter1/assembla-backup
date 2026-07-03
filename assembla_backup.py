@@ -18,6 +18,7 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,10 +65,17 @@ class BackupError(Exception):
     """Any condition that must halt the whole backup."""
 
 
+class DownloadError(BackupError):
+    """A single file blob could not be downloaded (often an Assembla-side S3
+    issue). Tolerated by default and recorded, unless --strict-files is set."""
+
+
 class AssemblaClient:
     def __init__(self, key, secret):
         self._key = key
         self._secret = secret
+        self.failed_downloads = []
+        self._fail_lock = threading.Lock()
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -145,8 +153,8 @@ class AssemblaClient:
                     attempt = self._backoff(resp, attempt, path)
                     continue
                 if not resp.ok:
-                    raise BackupError(
-                        f"Download {path} returned {resp.status_code}"
+                    raise DownloadError(
+                        f"{path} returned {resp.status_code}: {resp.text[:160].strip()}"
                     )
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with open(dest, "wb") as fh:
@@ -246,7 +254,7 @@ def repo_path_from_url(url):
     return None
 
 
-def backup_space(client: AssemblaClient, space, root: Path, workers: int):
+def backup_space(client: AssemblaClient, space, root: Path, workers: int, strict_files: bool):
     space_id = space["id"]
     wiki_name = space.get("wiki_name") or space_id
     sdir = root / "spaces" / safe_name(wiki_name)
@@ -327,7 +335,16 @@ def backup_space(client: AssemblaClient, space, root: Path, workers: int):
             return
         fname = doc.get("filename") or doc.get("name") or "file"
         dest = sdir / "documents" / "files" / f"{doc_id}__{safe_name(fname)}"
-        client.download(f"spaces/{space_id}/documents/{doc_id}/download", dest)
+        try:
+            client.download(f"spaces/{space_id}/documents/{doc_id}/download", dest)
+        except DownloadError as exc:
+            if strict_files:
+                raise
+            with client._fail_lock:
+                client.failed_downloads.append({
+                    "space": wiki_name, "document_id": doc_id,
+                    "filename": fname, "reason": str(exc),
+                })
 
     parallel_map(fetch_file, documents, workers, label="files")
 
@@ -391,6 +408,8 @@ def parse_args():
                     help="List every space the API key can access, then exit (no backup).")
     ap.add_argument("--workers", type=int, default=8,
                     help="Concurrent API requests for comments/files/wiki (default: 8).")
+    ap.add_argument("--strict-files", action="store_true",
+                    help="Treat any file-download failure as fatal (default: record and continue).")
     return ap.parse_args()
 
 
@@ -439,17 +458,28 @@ def main():
 
     summaries = []
     for space in spaces:
-        summaries.append(backup_space(client, space, root, args.workers))
+        summaries.append(backup_space(client, space, root, args.workers, args.strict_files))
 
+    failed = client.failed_downloads
     write_json(root / "manifest.json", {
         "generated_utc": stamp,
         "tool": "assembla-backup",
         "space_count": len(summaries),
         "spaces": summaries,
+        "failed_download_count": len(failed),
+        "failed_downloads": failed,
     })
+
+    if failed:
+        print(f"{YELLOW}    {len(failed)} file(s) could not be downloaded "
+              f"(Assembla-side errors); listed in manifest.failed_downloads{RESET}")
 
     if args.no_zip:
         ok(f"Done. Backup folder: {root}")
+    elif failed:
+        zip_path = make_zip(root)
+        print(f"{YELLOW}    Backup complete EXCEPT {len(failed)} unreachable file(s): "
+              f"{zip_path}{RESET}")
     else:
         zip_path = make_zip(root)
         ok(f"Done. Verified-complete backup: {zip_path}")
