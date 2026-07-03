@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -254,7 +255,8 @@ def repo_path_from_url(url):
     return None
 
 
-def backup_space(client: AssemblaClient, space, root: Path, workers: int, strict_files: bool):
+def backup_space(client: AssemblaClient, space, root: Path, workers: int,
+                 strict_files: bool, username):
     space_id = space["id"]
     wiki_name = space.get("wiki_name") or space_id
     sdir = root / "spaces" / safe_name(wiki_name)
@@ -266,14 +268,6 @@ def backup_space(client: AssemblaClient, space, root: Path, workers: int, strict
     info("fetching space tools")
     tools = client.get(f"spaces/{space_id}/space_tools") or []
     write_json(sdir / "space_tools.json", tools)
-
-    for tool in tools:
-        if is_svn_tool(tool):
-            raise BackupError(
-                f"Space '{wiki_name}' contains an SVN repository "
-                f"(tool '{tool.get('name') or tool.get('menu_name')}'). "
-                f"SVN is not supported."
-            )
 
     # Users and roles.
     info("fetching users and roles")
@@ -348,20 +342,38 @@ def backup_space(client: AssemblaClient, space, root: Path, workers: int, strict
 
     parallel_map(fetch_file, documents, workers, label="files")
 
-    # Repositories (git only; SVN already rejected above). The GitTool carries
-    # the clone URL directly, e.g. "git@git.assembla.com:<path>.git".
+    # Repositories. Git tools are mirror-cloned; SVN tools are dumped in full
+    # with svnrdump (a complete, reloadable history dump).
     repos = []
     for tool in tools:
-        if not is_git_tool(tool):
-            continue
-        repo_path = repo_path_from_url(tool.get("url"))
-        if not repo_path:
-            raise BackupError(f"GitTool in '{wiki_name}' has no usable clone URL: {tool.get('url')!r}")
-        repo_label = safe_name(tool.get("name") or tool.get("menu_name") or repo_path)
-        dest = sdir / "repos" / f"{repo_label}.git"
-        step(f"  cloning repo {repo_label}  ({GIT_HOST}/{repo_path})")
-        clone_mirror(client.git_url(repo_path), dest)
-        repos.append({"tool": repo_label, "clone_path": repo_path})
+        if is_git_tool(tool):
+            repo_path = repo_path_from_url(tool.get("url"))
+            if not repo_path:
+                raise BackupError(f"GitTool in '{wiki_name}' has no usable clone URL: {tool.get('url')!r}")
+            repo_label = safe_name(tool.get("name") or tool.get("menu_name") or repo_path)
+            dest = sdir / "repos" / f"{repo_label}.git"
+            step(f"  cloning git repo {repo_label}  ({GIT_HOST}/{repo_path})")
+            clone_mirror(client.git_url(repo_path), dest)
+            repos.append({"kind": "git", "tool": repo_label, "source": repo_path})
+        elif is_svn_tool(tool):
+            svn_url = tool.get("url")
+            if not svn_url:
+                raise BackupError(f"SubversionTool in '{wiki_name}' has no url")
+            if not username:
+                raise BackupError(
+                    f"Space '{wiki_name}' has an SVN repository, which needs "
+                    f"ASSEMBLA_USERNAME set (see .env.example)."
+                )
+            if not shutil.which("svnrdump"):
+                raise BackupError(
+                    f"Space '{wiki_name}' has an SVN repository but 'svnrdump' is "
+                    f"not on PATH. Install Subversion (which provides svnrdump)."
+                )
+            repo_label = safe_name(tool.get("name") or tool.get("menu_name") or "svn")
+            dest = sdir / "repos" / f"{repo_label}.svndump"
+            step(f"  dumping svn repo {repo_label}  ({svn_url})")
+            svn_dump(svn_url, dest, username, client._secret)
+            repos.append({"kind": "svn", "tool": repo_label, "source": svn_url})
     if repos:
         info(f"{len(repos)} repositories")
 
@@ -386,6 +398,24 @@ def clone_mirror(url_with_creds, dest: Path):
     if result.returncode != 0:
         # Never surface the credentialed URL in the error.
         raise BackupError(f"git clone --mirror failed for {dest.name}: {result.stderr.strip()[:400]}")
+
+
+def svn_dump(url, dest: Path, username, password):
+    """Full-history dump of a remote SVN repo via svnrdump (all revisions)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        raise BackupError(f"Destination already exists: {dest}")
+    with open(dest, "wb") as fh:
+        result = subprocess.run(
+            ["svnrdump", "dump", "--non-interactive", "--no-auth-cache",
+             "--username", username, "--password", password, url],
+            stdout=fh, stderr=subprocess.PIPE, text=False,
+        )
+    if result.returncode != 0:
+        raise BackupError(
+            f"svnrdump dump failed for {dest.name}: "
+            f"{result.stderr.decode(errors='replace').strip()[:400]}"
+        )
 
 
 def make_zip(folder: Path) -> Path:
@@ -421,6 +451,9 @@ def main():
     if not key or not secret:
         fail("ASSEMBLA_API_KEY and ASSEMBLA_API_SECRET must be set (see .env.example).")
         return 2
+
+    # Optional: only required for spaces that contain an SVN repository.
+    username = os.getenv("ASSEMBLA_USERNAME")
 
     client = AssemblaClient(key, secret)
 
@@ -458,7 +491,8 @@ def main():
 
     summaries = []
     for space in spaces:
-        summaries.append(backup_space(client, space, root, args.workers, args.strict_files))
+        summaries.append(backup_space(client, space, root, args.workers,
+                                      args.strict_files, username))
 
     failed = client.failed_downloads
     write_json(root / "manifest.json", {

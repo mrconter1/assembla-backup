@@ -12,14 +12,15 @@ Unlike the partial exporters out there, this aims for *everything in one archive
 - **Wiki** - pages plus full version history
 - **Documents / attachments** - metadata **and** the downloaded file bytes
 - **Users & roles** - so authors/assignees are readable
-- **Git repositories** - full history, all branches and tags (bare `--mirror` clones)
+- **Repositories** - Git (full history via bare `--mirror` clone) and SVN (full history via `svnrdump` dump)
 
 Everything the API returns is saved as **raw JSON** (faithful and re-importable), not reshaped.
 
 ## Requirements
 
 - **Python 3.10+** with `requests` and `python-dotenv` (`pip install -r requirements.txt`)
-- **`git`** on your PATH (used for the repository clones)
+- **`git`** on your PATH (for Git repositories)
+- **`svnrdump`** on your PATH (only if a space has an SVN repo; ships with Subversion)
 
 ## Setup
 
@@ -30,6 +31,8 @@ Everything the API returns is saved as **raw JSON** (faithful and re-importable)
    ```
    ASSEMBLA_API_KEY=your_key
    ASSEMBLA_API_SECRET=your_secret
+   # Only needed if a space has an SVN repo:
+   ASSEMBLA_USERNAME=your_assembla_login
    ```
 
 The API is called with headers `X-Api-Key` / `X-Api-Secret` against `https://api.assembla.com/v1/`. Repositories are cloned via `https://<key>:<secret>@git.assembla.com/<repo>.git`.
@@ -72,7 +75,9 @@ assembla-backup-<timestamp>/
     ├── milestones.json
     ├── wiki/_index.json  wiki/versions/<page_id>.json
     ├── documents/_index.json  documents/files/<doc_id>__<filename>
-    └── repos/<repo_name>.git/     # bare --mirror clone
+    └── repos/
+        ├── <repo_name>.git/       # git: bare --mirror clone
+        └── <repo_name>.svndump    # svn: full svnrdump dump (reload with `svnadmin load`)
 → zipped to assembla-backup-<timestamp>.zip
 ```
 
@@ -84,9 +89,10 @@ Rate-limit responses (`429`/`503`) are retried with backoff (honoring `Retry-Aft
 
 **One deliberate exception: individual file downloads.** Assembla occasionally hands out broken presigned S3 URLs (e.g. a signature signed for the wrong region), so a specific attachment can be un-downloadable through no fault of yours. Rather than let one dead blob abort a multi-space backup, such a file is **recorded and skipped**, listed under `failed_downloads` in `manifest.json`, and the final message clearly says "complete EXCEPT N unreachable file(s)" instead of "verified complete". Pass `--strict-files` to make these fatal instead.
 
-## Not supported
+## Restoring a repository
 
-- **SVN repositories.** If a space contains an SVN tool, the script **stops** and reports it - git only for now.
+- **Git:** `git clone <repo_name>.git restored` (it is a normal bare mirror).
+- **SVN:** `svnadmin create restored && svnadmin load restored < <repo_name>.svndump`.
 
 ## Security
 
