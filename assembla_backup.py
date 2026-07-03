@@ -91,14 +91,23 @@ class AssemblaClient:
         """GET {API_BASE}/{path}. Fail-fast on unexpected status.
 
         Returns parsed JSON, or None when allow_404 and the resource is 404.
-        Retries only on 429/503 (rate limiting), then fails.
+        Retries transient connection errors and 429/503, then fails.
         """
         url = f"{API_BASE}/{path}"
         attempt = 0
         while True:
-            resp = self.session.get(url, params=params, timeout=TIMEOUT)
+            try:
+                resp = self.session.get(url, params=params, timeout=TIMEOUT)
+            except requests.exceptions.RequestException as exc:
+                attempt = self._sleep_retry(attempt, path, f"connection error ({exc.__class__.__name__})")
+                if attempt is None:
+                    raise BackupError(f"GET {path} failed after retries: {exc}")
+                continue
             if resp.status_code in (429, 503):
-                attempt = self._backoff(resp, attempt, path)
+                attempt = self._sleep_retry(attempt, path, f"rate limited ({resp.status_code})",
+                                            resp.headers.get("Retry-After"))
+                if attempt is None:
+                    raise BackupError(f"Rate limited on {path} after {MAX_RATE_LIMIT_RETRIES} retries")
                 continue
             if resp.status_code == 404 and allow_404:
                 return None
@@ -149,44 +158,54 @@ class AssemblaClient:
             page += 1
 
     def download(self, path, dest: Path):
-        """Stream a binary download endpoint to a file. Fail-fast."""
+        """Stream a binary download endpoint to a file.
+
+        Retries transient connection errors and 429/503. A persistent failure
+        raises DownloadError (recorded and skipped unless --strict-files).
+        """
         url = f"{API_BASE}/{path}"
         attempt = 0
         while True:
-            with self.session.get(url, stream=True, timeout=TIMEOUT) as resp:
-                if resp.status_code in (429, 503):
-                    attempt = self._backoff(resp, attempt, path)
-                    continue
-                if not resp.ok:
-                    raise DownloadError(
-                        f"{path} returned {resp.status_code}: {resp.text[:160].strip()}"
-                    )
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                with open(dest, "wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            fh.write(chunk)
-                return
+            try:
+                with self.session.get(url, stream=True, timeout=TIMEOUT) as resp:
+                    if resp.status_code in (429, 503):
+                        attempt = self._sleep_retry(attempt, path, f"rate limited ({resp.status_code})",
+                                                    resp.headers.get("Retry-After"))
+                        if attempt is None:
+                            raise DownloadError(f"{path} rate limited after retries")
+                        continue
+                    if not resp.ok:
+                        raise DownloadError(
+                            f"{path} returned {resp.status_code}: {resp.text[:160].strip()}"
+                        )
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with open(dest, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                fh.write(chunk)
+                    return
+            except requests.exceptions.RequestException as exc:
+                attempt = self._sleep_retry(attempt, path, f"connection error ({exc.__class__.__name__})")
+                if attempt is None:
+                    raise DownloadError(f"{path} failed after retries: {exc}")
+                continue
 
-    def _backoff(self, resp, attempt, path):
-        """Wait after a 429/503, then return the incremented attempt count.
+    def _sleep_retry(self, attempt, path, reason, retry_after=None):
+        """Sleep before a retry; return the new attempt count, or None if the
+        retry budget is exhausted.
 
-        Honors the server's Retry-After header when present, otherwise uses
-        exponential backoff. Adds jitter so concurrent workers do not retry in
-        lockstep. Raises once the retry budget is exhausted.
+        Honors a numeric Retry-After header, otherwise exponential backoff, plus
+        jitter so concurrent workers do not retry in lockstep.
         """
         attempt += 1
         if attempt > MAX_RATE_LIMIT_RETRIES:
-            raise BackupError(
-                f"Rate limited on {path} after {MAX_RATE_LIMIT_RETRIES} retries"
-            )
-        retry_after = resp.headers.get("Retry-After")
+            return None
         if retry_after and retry_after.strip().isdigit():
             wait = float(retry_after)
         else:
             wait = min(60.0, 2.0 ** attempt)
         wait += random.uniform(0, 1)  # jitter
-        info(f"rate limited ({resp.status_code}) on {path}, waiting {wait:.1f}s")
+        info(f"{reason} on {path}, retry {attempt}/{MAX_RATE_LIMIT_RETRIES} in {wait:.1f}s")
         time.sleep(wait)
         return attempt
 
@@ -548,3 +567,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         fail("Interrupted.")
         sys.exit(130)
+    except Exception as exc:  # noqa: BLE001 - clean exit instead of a raw traceback
+        fail(f"Unexpected {exc.__class__.__name__}: {exc}")
+        fail("Backup halted. No zip produced; partial output (if any) left for inspection.")
+        sys.exit(1)
