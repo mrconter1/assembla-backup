@@ -15,10 +15,12 @@ only written after every step of every space succeeds, so a zip always means
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote
 
@@ -86,14 +88,7 @@ class AssemblaClient:
         while True:
             resp = self.session.get(url, params=params, timeout=TIMEOUT)
             if resp.status_code in (429, 503):
-                attempt += 1
-                if attempt > MAX_RATE_LIMIT_RETRIES:
-                    raise BackupError(
-                        f"Rate limited on {path} after {MAX_RATE_LIMIT_RETRIES} retries"
-                    )
-                wait = min(60, 2 ** attempt)
-                info(f"rate limited ({resp.status_code}) on {path}, waiting {wait}s")
-                time.sleep(wait)
+                attempt = self._backoff(resp, attempt, path)
                 continue
             if resp.status_code == 404 and allow_404:
                 return None
@@ -147,10 +142,7 @@ class AssemblaClient:
         while True:
             with self.session.get(url, stream=True, timeout=TIMEOUT) as resp:
                 if resp.status_code in (429, 503):
-                    attempt += 1
-                    if attempt > MAX_RATE_LIMIT_RETRIES:
-                        raise BackupError(f"Rate limited downloading {path}")
-                    time.sleep(min(60, 2 ** attempt))
+                    attempt = self._backoff(resp, attempt, path)
                     continue
                 if not resp.ok:
                     raise BackupError(
@@ -163,9 +155,56 @@ class AssemblaClient:
                             fh.write(chunk)
                 return
 
+    def _backoff(self, resp, attempt, path):
+        """Wait after a 429/503, then return the incremented attempt count.
+
+        Honors the server's Retry-After header when present, otherwise uses
+        exponential backoff. Adds jitter so concurrent workers do not retry in
+        lockstep. Raises once the retry budget is exhausted.
+        """
+        attempt += 1
+        if attempt > MAX_RATE_LIMIT_RETRIES:
+            raise BackupError(
+                f"Rate limited on {path} after {MAX_RATE_LIMIT_RETRIES} retries"
+            )
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after and retry_after.strip().isdigit():
+            wait = float(retry_after)
+        else:
+            wait = min(60.0, 2.0 ** attempt)
+        wait += random.uniform(0, 1)  # jitter
+        info(f"rate limited ({resp.status_code}) on {path}, waiting {wait:.1f}s")
+        time.sleep(wait)
+        return attempt
+
     def git_url(self, repo_path):
         """HTTPS clone URL with credentials embedded (secret is never logged)."""
         return f"https://{quote(self._key)}:{quote(self._secret)}@{GIT_HOST}/{repo_path}"
+
+
+def parallel_map(fn, items, workers, label=None):
+    """Run fn(item) over items with a bounded thread pool, preserving order.
+
+    Fail-fast: the first task to raise propagates out (remaining tasks are
+    cancelled), so a partial result never masquerades as complete.
+    """
+    if not items:
+        return []
+    results = [None] * len(items)
+    total = len(items)
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fn, item): idx for idx, item in enumerate(items)}
+        try:
+            for fut in as_completed(futs):
+                results[futs[fut]] = fut.result()  # re-raises task errors here
+                done += 1
+                if label and (done % 20 == 0 or done == total):
+                    info(f"  {label} {done}/{total}")
+        except BaseException:
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+    return results
 
 
 def write_json(path: Path, data):
@@ -190,7 +229,24 @@ def is_git_tool(tool):
     return "git" in t
 
 
-def backup_space(client: AssemblaClient, space, root: Path):
+def repo_path_from_url(url):
+    """Extract the repo path (e.g. 'space-name.git') from a GitTool url.
+
+    Handles the SSH form 'git@git.assembla.com:<path>' and the HTTPS form
+    'https://git.assembla.com/<path>'.
+    """
+    if not url:
+        return None
+    url = url.strip()
+    if url.startswith("git@"):
+        return url.split(":", 1)[1] if ":" in url else None
+    marker = f"{GIT_HOST}/"
+    if marker in url:
+        return url.split(marker, 1)[1]
+    return None
+
+
+def backup_space(client: AssemblaClient, space, root: Path, workers: int):
     space_id = space["id"]
     wiki_name = space.get("wiki_name") or space_id
     sdir = root / "spaces" / safe_name(wiki_name)
@@ -230,14 +286,15 @@ def backup_space(client: AssemblaClient, space, root: Path):
     tickets = list(client.paginate(f"spaces/{space_id}/tickets"))
     info(f"{len(tickets)} tickets; fetching comments")
     write_json(sdir / "tickets" / "_index.json", tickets)
-    for i, t in enumerate(tickets, 1):
+
+    def fetch_comments(t):
         number = t.get("number")
         if number is None:
-            continue
+            return
         comments = list(client.paginate(f"spaces/{space_id}/tickets/{number}/ticket_comments"))
         write_json(sdir / "tickets" / "comments" / f"{number}.json", comments)
-        if i % 10 == 0 or i == len(tickets):
-            info(f"  comments {i}/{len(tickets)}")
+
+    parallel_map(fetch_comments, tickets, workers, label="comments")
 
     # Milestones.
     write_json(sdir / "milestones.json",
@@ -247,12 +304,15 @@ def backup_space(client: AssemblaClient, space, root: Path):
     info("fetching wiki pages")
     wiki_pages = list(client.paginate(f"spaces/{space_id}/wiki_pages"))
     write_json(sdir / "wiki" / "_index.json", wiki_pages)
-    for wp in wiki_pages:
+
+    def fetch_wiki_versions(wp):
         wp_id = wp.get("id")
         if wp_id is None:
-            continue
+            return
         versions = list(client.paginate(f"spaces/{space_id}/wiki_pages/{wp_id}/versions"))
         write_json(sdir / "wiki" / "versions" / f"{wp_id}.json", versions)
+
+    parallel_map(fetch_wiki_versions, wiki_pages, workers, label="wiki versions")
     info(f"{len(wiki_pages)} wiki pages")
 
     # Documents (metadata + bytes).
@@ -260,31 +320,31 @@ def backup_space(client: AssemblaClient, space, root: Path):
     documents = list(client.paginate(f"spaces/{space_id}/documents"))
     info(f"{len(documents)} documents; downloading files")
     write_json(sdir / "documents" / "_index.json", documents)
-    for i, doc in enumerate(documents, 1):
+
+    def fetch_file(doc):
         doc_id = doc.get("id")
         if doc_id is None:
-            continue
+            return
         fname = doc.get("filename") or doc.get("name") or "file"
         dest = sdir / "documents" / "files" / f"{doc_id}__{safe_name(fname)}"
         client.download(f"spaces/{space_id}/documents/{doc_id}/download", dest)
-        if i % 10 == 0 or i == len(documents):
-            info(f"  files {i}/{len(documents)}")
 
-    # Repositories (git only; SVN already rejected above).
+    parallel_map(fetch_file, documents, workers, label="files")
+
+    # Repositories (git only; SVN already rejected above). The GitTool carries
+    # the clone URL directly, e.g. "git@git.assembla.com:<path>.git".
     repos = []
     for tool in tools:
         if not is_git_tool(tool):
             continue
-        repo_name = tool.get("name") or tool.get("menu_name") or f"repo_{tool.get('id')}"
-        # Assembla portfolio git repos clone from <wiki_name>.git; a named tool
-        # inside a space clones from <wiki_name>.<tool_name>.git.
-        candidate = wiki_name if safe_name(repo_name).lower() in (wiki_name.lower(), "git", "code") \
-            else f"{wiki_name}.{repo_name}"
-        repo_path = f"{candidate}.git"
-        dest = sdir / "repos" / f"{safe_name(repo_name)}.git"
-        step(f"  cloning repo {repo_name}  ({GIT_HOST}/{repo_path})")
+        repo_path = repo_path_from_url(tool.get("url"))
+        if not repo_path:
+            raise BackupError(f"GitTool in '{wiki_name}' has no usable clone URL: {tool.get('url')!r}")
+        repo_label = safe_name(tool.get("name") or tool.get("menu_name") or repo_path)
+        dest = sdir / "repos" / f"{repo_label}.git"
+        step(f"  cloning repo {repo_label}  ({GIT_HOST}/{repo_path})")
         clone_mirror(client.git_url(repo_path), dest)
-        repos.append({"tool": repo_name, "clone_path": repo_path})
+        repos.append({"tool": repo_label, "clone_path": repo_path})
     if repos:
         info(f"{len(repos)} repositories")
 
@@ -329,6 +389,8 @@ def parse_args():
     ap.add_argument("--no-zip", action="store_true", help="Keep the folder, skip creating the zip.")
     ap.add_argument("--list-spaces", action="store_true",
                     help="List every space the API key can access, then exit (no backup).")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="Concurrent API requests for comments/files/wiki (default: 8).")
     return ap.parse_args()
 
 
@@ -377,7 +439,7 @@ def main():
 
     summaries = []
     for space in spaces:
-        summaries.append(backup_space(client, space, root))
+        summaries.append(backup_space(client, space, root, args.workers))
 
     write_json(root / "manifest.json", {
         "generated_utc": stamp,
