@@ -29,6 +29,9 @@ API_BASE = "https://api.assembla.com/v1"
 GIT_HOST = "git.assembla.com"
 PER_PAGE = 100
 MAX_RATE_LIMIT_RETRIES = 5
+# (connect timeout, read timeout) seconds. Read timeout is per-chunk, so large
+# downloads are fine; it only trips when the server stops responding.
+TIMEOUT = (10, 60)
 
 # ANSI colours (work in modern Windows Terminal and most shells)
 RED = "\033[31m"
@@ -81,7 +84,7 @@ class AssemblaClient:
         url = f"{API_BASE}/{path}"
         attempt = 0
         while True:
-            resp = self.session.get(url, params=params)
+            resp = self.session.get(url, params=params, timeout=TIMEOUT)
             if resp.status_code in (429, 503):
                 attempt += 1
                 if attempt > MAX_RATE_LIMIT_RETRIES:
@@ -106,10 +109,16 @@ class AssemblaClient:
                 raise BackupError(f"GET {path} returned non-JSON body: {exc}")
 
     def paginate(self, path, params=None):
-        """Yield every item across all pages of a list endpoint."""
+        """Yield every item across all pages of a list endpoint.
+
+        Self-terminating: stops on a short/empty page, and also if a page
+        contains no items we have not already seen (guards against endpoints
+        that ignore page/per_page and return the whole list every time).
+        """
         params = dict(params or {})
         params["per_page"] = PER_PAGE
         page = 1
+        seen = set()
         while True:
             params["page"] = page
             batch = self.get(path, params=params)
@@ -117,9 +126,17 @@ class AssemblaClient:
                 return
             if not isinstance(batch, list):
                 raise BackupError(f"Expected a list from {path}, got {type(batch).__name__}")
+            new = 0
             for item in batch:
+                key = item.get("id") or item.get("number") if isinstance(item, dict) else None
+                if key is None:
+                    key = repr(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                new += 1
                 yield item
-            if len(batch) < PER_PAGE:
+            if len(batch) < PER_PAGE or new == 0:
                 return
             page += 1
 
@@ -128,7 +145,7 @@ class AssemblaClient:
         url = f"{API_BASE}/{path}"
         attempt = 0
         while True:
-            with self.session.get(url, stream=True) as resp:
+            with self.session.get(url, stream=True, timeout=TIMEOUT) as resp:
                 if resp.status_code in (429, 503):
                     attempt += 1
                     if attempt > MAX_RATE_LIMIT_RETRIES:
@@ -182,6 +199,7 @@ def backup_space(client: AssemblaClient, space, root: Path):
     write_json(sdir / "space.json", space)
 
     # Tools (discover repos, and detect SVN early).
+    info("fetching space tools")
     tools = client.get(f"spaces/{space_id}/space_tools") or []
     write_json(sdir / "space_tools.json", tools)
 
@@ -194,10 +212,12 @@ def backup_space(client: AssemblaClient, space, root: Path):
             )
 
     # Users and roles.
+    info("fetching users and roles")
     write_json(sdir / "users.json", client.get(f"spaces/{space_id}/users") or [])
     write_json(sdir / "user_roles.json", client.get(f"spaces/{space_id}/user_roles") or [])
 
     # Ticket schema.
+    info("fetching ticket schema (statuses, custom fields, tags)")
     write_json(sdir / "tickets" / "statuses.json",
                client.get(f"spaces/{space_id}/tickets/statuses", allow_404=True) or [])
     write_json(sdir / "tickets" / "custom_fields.json",
@@ -206,7 +226,9 @@ def backup_space(client: AssemblaClient, space, root: Path):
                client.get(f"spaces/{space_id}/tags", allow_404=True) or [])
 
     # Tickets + comments.
+    info("fetching tickets")
     tickets = list(client.paginate(f"spaces/{space_id}/tickets"))
+    info(f"{len(tickets)} tickets; fetching comments")
     write_json(sdir / "tickets" / "_index.json", tickets)
     for t in tickets:
         number = t.get("number")
@@ -221,6 +243,7 @@ def backup_space(client: AssemblaClient, space, root: Path):
                client.get(f"spaces/{space_id}/milestones/all", allow_404=True) or [])
 
     # Wiki + versions.
+    info("fetching wiki pages")
     wiki_pages = list(client.paginate(f"spaces/{space_id}/wiki_pages"))
     write_json(sdir / "wiki" / "_index.json", wiki_pages)
     for wp in wiki_pages:
@@ -232,7 +255,9 @@ def backup_space(client: AssemblaClient, space, root: Path):
     info(f"{len(wiki_pages)} wiki pages")
 
     # Documents (metadata + bytes).
+    info("fetching documents")
     documents = list(client.paginate(f"spaces/{space_id}/documents"))
+    info(f"{len(documents)} documents; downloading files")
     write_json(sdir / "documents" / "_index.json", documents)
     for doc in documents:
         doc_id = doc.get("id")
