@@ -113,12 +113,15 @@ class AssemblaClient:
             except ValueError as exc:
                 raise BackupError(f"GET {path} returned non-JSON body: {exc}")
 
-    def paginate(self, path, params=None):
+    def paginate(self, path, params=None, optional=False):
         """Yield every item across all pages of a list endpoint.
 
         Self-terminating: stops on a short/empty page, and also if a page
         contains no items we have not already seen (guards against endpoints
         that ignore page/per_page and return the whole list every time).
+
+        optional=True treats a 404 (e.g. "Tool not found for this project",
+        when a space simply lacks that tool) as an empty result.
         """
         params = dict(params or {})
         params["per_page"] = PER_PAGE
@@ -126,8 +129,8 @@ class AssemblaClient:
         seen = set()
         while True:
             params["page"] = page
-            batch = self.get(path, params=params)
-            if not batch:
+            batch = self.get(path, params=params, allow_404=optional)
+            if not batch:  # None (optional 404) or empty page
                 return
             if not isinstance(batch, list):
                 raise BackupError(f"Expected a list from {path}, got {type(batch).__name__}")
@@ -286,7 +289,7 @@ def backup_space(client: AssemblaClient, space, root: Path, workers: int,
 
     # Tickets + comments.
     info("fetching tickets")
-    tickets = list(client.paginate(f"spaces/{space_id}/tickets"))
+    tickets = list(client.paginate(f"spaces/{space_id}/tickets", optional=True))
     info(f"{len(tickets)} tickets; fetching comments")
     write_json(sdir / "tickets" / "_index.json", tickets)
 
@@ -305,7 +308,7 @@ def backup_space(client: AssemblaClient, space, root: Path, workers: int,
 
     # Wiki + versions.
     info("fetching wiki pages")
-    wiki_pages = list(client.paginate(f"spaces/{space_id}/wiki_pages"))
+    wiki_pages = list(client.paginate(f"spaces/{space_id}/wiki_pages", optional=True))
     write_json(sdir / "wiki" / "_index.json", wiki_pages)
 
     def fetch_wiki_versions(wp):
@@ -320,7 +323,7 @@ def backup_space(client: AssemblaClient, space, root: Path, workers: int,
 
     # Documents (metadata + bytes).
     info("fetching documents")
-    documents = list(client.paginate(f"spaces/{space_id}/documents"))
+    documents = list(client.paginate(f"spaces/{space_id}/documents", optional=True))
     info(f"{len(documents)} documents; downloading files")
     write_json(sdir / "documents" / "_index.json", documents)
 
