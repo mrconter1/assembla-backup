@@ -230,13 +230,14 @@ def backup_space(client: AssemblaClient, space, root: Path):
     tickets = list(client.paginate(f"spaces/{space_id}/tickets"))
     info(f"{len(tickets)} tickets; fetching comments")
     write_json(sdir / "tickets" / "_index.json", tickets)
-    for t in tickets:
+    for i, t in enumerate(tickets, 1):
         number = t.get("number")
         if number is None:
             continue
         comments = list(client.paginate(f"spaces/{space_id}/tickets/{number}/ticket_comments"))
         write_json(sdir / "tickets" / "comments" / f"{number}.json", comments)
-    info(f"{len(tickets)} tickets")
+        if i % 10 == 0 or i == len(tickets):
+            info(f"  comments {i}/{len(tickets)}")
 
     # Milestones.
     write_json(sdir / "milestones.json",
@@ -259,14 +260,15 @@ def backup_space(client: AssemblaClient, space, root: Path):
     documents = list(client.paginate(f"spaces/{space_id}/documents"))
     info(f"{len(documents)} documents; downloading files")
     write_json(sdir / "documents" / "_index.json", documents)
-    for doc in documents:
+    for i, doc in enumerate(documents, 1):
         doc_id = doc.get("id")
         if doc_id is None:
             continue
         fname = doc.get("filename") or doc.get("name") or "file"
         dest = sdir / "documents" / "files" / f"{doc_id}__{safe_name(fname)}"
         client.download(f"spaces/{space_id}/documents/{doc_id}/download", dest)
-    info(f"{len(documents)} documents")
+        if i % 10 == 0 or i == len(documents):
+            info(f"  files {i}/{len(documents)}")
 
     # Repositories (git only; SVN already rejected above).
     repos = []
