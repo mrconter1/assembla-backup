@@ -28,12 +28,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 
 API_BASE = "https://api.assembla.com/v1"
 GIT_HOST = "git.assembla.com"
 PER_PAGE = 100
 MAX_RATE_LIMIT_RETRIES = 5
+CONN_POOL = 32  # HTTP connection pool size (>= max --workers you intend to use)
+MAX_LEAF = 110  # cap on a saved filename length (Windows MAX_PATH safety)
 # (connect timeout, read timeout) seconds. Read timeout is per-chunk, so large
 # downloads are fine; it only trips when the server stops responding.
 TIMEOUT = (10, 60)
@@ -86,6 +89,11 @@ class AssemblaClient:
                 "Accept": "application/json",
             }
         )
+        # Size the connection pool for concurrency so extra workers do not
+        # thrash new connections on every request.
+        adapter = HTTPAdapter(pool_connections=CONN_POOL, pool_maxsize=CONN_POOL)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def get(self, path, params=None, *, allow_404=False):
         """GET {API_BASE}/{path}. Fail-fast on unexpected status.
@@ -251,6 +259,23 @@ def safe_name(value):
     return "".join(c if c.isalnum() or c in keep else "_" for c in str(value)).strip() or "unnamed"
 
 
+def capped_leaf(doc_id, fname):
+    """A filesystem-safe, length-capped leaf name for a downloaded document.
+
+    Keeps the doc_id prefix (guarantees uniqueness) and preserves the file
+    extension, truncating only the human-readable part so the full path stays
+    under the Windows MAX_PATH limit.
+    """
+    name = safe_name(fname)
+    if len(name) > MAX_LEAF:
+        stem, dot, ext = name.rpartition(".")
+        if dot and 0 < len(ext) <= 8:
+            name = stem[:MAX_LEAF - len(ext) - 1] + "." + ext
+        else:
+            name = name[:MAX_LEAF]
+    return f"{doc_id}__{name}"
+
+
 def is_svn_tool(tool):
     t = f"{tool.get('type', '')} {tool.get('name', '')} {tool.get('menu_name', '')}".lower()
     return "subversion" in t or "svn" in t
@@ -351,7 +376,7 @@ def backup_space(client: AssemblaClient, space, root: Path, workers: int,
         if doc_id is None:
             return
         fname = doc.get("filename") or doc.get("name") or "file"
-        dest = sdir / "documents" / "files" / f"{doc_id}__{safe_name(fname)}"
+        dest = sdir / "documents" / "files" / capped_leaf(doc_id, fname)
         try:
             client.download(f"spaces/{space_id}/documents/{doc_id}/download", dest)
         except DownloadError as exc:
@@ -474,7 +499,8 @@ def parse_args():
     ap.add_argument("--list-spaces", action="store_true",
                     help="List every space the API key can access, then exit (no backup).")
     ap.add_argument("--workers", type=int, default=8,
-                    help="Concurrent API requests for comments/files/wiki (default: 8).")
+                    help=f"Concurrent requests for comments/files/wiki (default: 8, "
+                         f"raise for speed up to the {CONN_POOL}-connection pool).")
     ap.add_argument("--strict-files", action="store_true",
                     help="Treat any file-download failure as fatal (default: record and continue).")
     return ap.parse_args()
