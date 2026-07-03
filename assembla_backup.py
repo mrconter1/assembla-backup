@@ -300,6 +300,8 @@ def parse_args():
                     help="Restrict to specific spaces (by wiki_name or id). Default: all accessible.")
     ap.add_argument("--out", default=".", help="Directory to write the backup into (default: current).")
     ap.add_argument("--no-zip", action="store_true", help="Keep the folder, skip creating the zip.")
+    ap.add_argument("--list-spaces", action="store_true",
+                    help="List every space the API key can access, then exit (no backup).")
     return ap.parse_args()
 
 
@@ -313,6 +315,15 @@ def main():
         return 2
 
     client = AssemblaClient(key, secret)
+
+    if args.list_spaces:
+        step("Listing accessible spaces")
+        spaces = list(client.paginate("spaces"))
+        ok(f"{len(spaces)} space(s) visible to this key:")
+        for s in spaces:
+            print(f"    {s.get('wiki_name','?'):<28} {s.get('name','')}  "
+                  f"[id={s.get('id','?')}]")
+        return 0
 
     # Timestamp passed in from the OS (kept out of core logic for reproducibility).
     stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
